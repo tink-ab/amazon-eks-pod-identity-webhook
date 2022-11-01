@@ -32,9 +32,13 @@ import (
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/handler"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	flag "github.com/spf13/pflag"
+	"k8s.io/client-go/informers"
+	v1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
+	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
+	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 )
 
 var webhookVersion = "v0.1.0"
@@ -55,7 +59,7 @@ func main() {
 	// in-cluster TLS options
 	inCluster := flag.Bool("in-cluster", true, "Use in-cluster authentication and certificate request API")
 	serviceName := flag.String("service-name", "pod-identity-webhook", "(in-cluster) The service name fronting this webhook")
-	namespaceName := flag.String("namespace", "eks", "(in-cluster) The namespace name this webhook and the tls secret resides in")
+	namespaceName := flag.String("namespace", "eks", "(in-cluster) The namespace name this webhook, the TLS secret, and configmap resides in")
 	tlsSecret := flag.String("tls-secret", "pod-identity-webhook", "(in-cluster) The secret name for storing the TLS serving cert")
 
 	// annotation/volume configurations
@@ -66,6 +70,7 @@ func main() {
 	tokenExpiration := flag.Int64("token-expiration", pkg.DefaultTokenExpiration, "The token expiration")
 	region := flag.String("aws-default-region", "", "If set, AWS_DEFAULT_REGION and AWS_REGION will be set to this value in mutated containers")
 	regionalSTS := flag.Bool("sts-regional-endpoint", false, "Whether to inject the AWS_STS_REGIONAL_ENDPOINTS=regional env var in mutated pods. Defaults to `false`.")
+	watchConfigMap := flag.Bool("watch-config-map", false, "Enables watching serviceaccounts that are configured through the pod-identity-webhook configmap instead of using annotations")
 
 	version := flag.Bool("version", false, "Display the version and exit")
 
@@ -98,6 +103,17 @@ func main() {
 	if err != nil {
 		klog.Fatalf("Error creating clientset: %v", err.Error())
 	}
+	informerFactory := informers.NewSharedInformerFactory(clientset, 60*time.Second)
+
+	var cmInformer v1.ConfigMapInformer
+	var nsInformerFactory informers.SharedInformerFactory
+	if *watchConfigMap {
+		klog.Infof("Watching ConfigMap pod-identity-webhook in %s namespace", *namespaceName)
+		nsInformerFactory = informers.NewSharedInformerFactoryWithOptions(clientset, 60*time.Second, informers.WithNamespace(*namespaceName))
+		cmInformer = nsInformerFactory.Core().V1().ConfigMaps()
+	}
+
+	saInformer := informerFactory.Core().V1().ServiceAccounts()
 
 	*tokenExpiration = pkg.ValidateMinTokenExpiration(*tokenExpiration)
 	saCache := cache.New(
@@ -105,17 +121,24 @@ func main() {
 		*annotationPrefix,
 		*regionalSTS,
 		*tokenExpiration,
-		clientset,
+		saInformer,
+		cmInformer,
 	)
-	saCache.Start()
+	stop := make(chan struct{})
+	informerFactory.Start(stop)
+
+	if *watchConfigMap {
+		nsInformerFactory.Start(stop)
+	}
+
+	saCache.Start(stop)
+	defer close(stop)
 
 	mod := handler.NewModifier(
 		handler.WithAnnotationDomain(*annotationPrefix),
-		handler.WithExpiration(*tokenExpiration),
 		handler.WithMountPath(*mountPath),
 		handler.WithServiceAccountCache(saCache),
 		handler.WithRegion(*region),
-		handler.WithRegionalSTS(*regionalSTS),
 		handler.WithBaseArn(*baseArn),
 	)
 
@@ -146,6 +169,8 @@ func main() {
 		// Expose other debug paths
 	}
 
+	// setup signal handler to be passed to certwatcher and http server
+	signalHandlerCtx := signals.SetupSignalHandler()
 	tlsConfig := &tls.Config{}
 
 	if *inCluster {
@@ -183,11 +208,18 @@ func main() {
 			return certificate, nil
 		}
 	} else {
-		certificate, err := tls.LoadX509KeyPair(*tlsCertFile, *tlsKeyFile)
+		watcher, err := certwatcher.New(*tlsCertFile, *tlsKeyFile)
 		if err != nil {
-			klog.Fatalf("failed to load TLS cert and key: %v", err)
+			klog.Fatalf("Error initializing certwatcher: %q", err)
 		}
-		tlsConfig.Certificates = []tls.Certificate{certificate}
+
+		go func() {
+			if err := watcher.Start(signalHandlerCtx); err != nil {
+				klog.Fatalf("Error starting certwatcher: %q", err)
+			}
+		}()
+
+		tlsConfig.GetCertificate = watcher.GetCertificate
 	}
 
 	klog.Info("Creating server")
@@ -196,7 +228,8 @@ func main() {
 		Handler:   mux,
 		TLSConfig: tlsConfig,
 	}
-	handler.ShutdownOnTerm(server, time.Duration(10)*time.Second)
+
+	handler.ShutdownFromContext(signalHandlerCtx, server, time.Duration(10)*time.Second)
 
 	metricsServer := &http.Server{
 		Addr:    metricsAddr,
