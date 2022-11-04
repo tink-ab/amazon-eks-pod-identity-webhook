@@ -1,0 +1,198 @@
+From f3f4c00b165c860adb89d06712739f1cfb7623d2 Mon Sep 17 00:00:00 2001
+From: Ahmed Magdy <ahmed.magdy@tink.com>
+Date: Fri, 4 Nov 2022 11:13:04 +0100
+Subject: [PATCH] Adopt eks-pod-identity-webhook for tink usecase
+
+---
+ README.md                                     |  1 +
+ main.go                                       |  2 +
+ pkg/handler/handler.go                        | 37 ++++++++++++++-----
+ pkg/handler/handler_pod_test.go               |  4 ++
+ pkg/handler/testdata/rawPodNoBaseArn.pod.yaml | 17 +++++++++
+ 5 files changed, 52 insertions(+), 9 deletions(-)
+ create mode 100644 pkg/handler/testdata/rawPodNoBaseArn.pod.yaml
+
+diff --git a/README.md b/README.md
+index 901afbf..8ddcee5 100644
+--- a/README.md
++++ b/README.md
+@@ -148,6 +148,7 @@ Usage of amazon-eks-pod-identity-webhook:
+       --annotation-prefix string         The Service Account annotation to look for (default "eks.amazonaws.com")
+       --aws-default-region string        If set, AWS_DEFAULT_REGION and AWS_REGION will be set to this value in mutated containers
+       --enable-debugging-handlers        Enable debugging handlers. Currently /debug/alpha/cache is supported
++      --base-arn string                  The base arn to use if a non fully qualified role is detected
+       --in-cluster                       Use in-cluster authentication and certificate request API (default true)
+       --kube-api string                  (out-of-cluster) The url to the API server
+       --kubeconfig string                (out-of-cluster) Absolute path to the API server kubeconfig file
+diff --git a/main.go b/main.go
+index 1f6083b..4e81107 100644
+--- a/main.go
++++ b/main.go
+@@ -65,6 +65,7 @@ func main() {
+ 	// annotation/volume configurations
+ 	annotationPrefix := flag.String("annotation-prefix", "eks.amazonaws.com", "The Service Account annotation to look for")
+ 	audience := flag.String("token-audience", "sts.amazonaws.com", "The default audience for tokens. Can be overridden by annotation")
++	baseArn := flag.String("base-arn", "", "The base arn to use if a non fully qualified role is detected")
+ 	mountPath := flag.String("token-mount-path", "/var/run/secrets/eks.amazonaws.com/serviceaccount", "The path to mount tokens")
+ 	tokenExpiration := flag.Int64("token-expiration", pkg.DefaultTokenExpiration, "The token expiration")
+ 	region := flag.String("aws-default-region", "", "If set, AWS_DEFAULT_REGION and AWS_REGION will be set to this value in mutated containers")
+@@ -138,6 +139,7 @@ func main() {
+ 		handler.WithMountPath(*mountPath),
+ 		handler.WithServiceAccountCache(saCache),
+ 		handler.WithRegion(*region),
++		handler.WithBaseArn(*baseArn),
+ 	)
+ 
+ 	addr := fmt.Sprintf(":%d", *port)
+diff --git a/pkg/handler/handler.go b/pkg/handler/handler.go
+index a977c63..6106960 100644
+--- a/pkg/handler/handler.go
++++ b/pkg/handler/handler.go
+@@ -47,6 +47,8 @@ var (
+ 	deserializer  = codecs.UniversalDeserializer()
+ )
+ 
++const arnPrefix = "arn:"
++
+ // ModifierOpt is an option type for setting up a Modifier
+ type ModifierOpt func(*Modifier)
+ 
+@@ -65,6 +67,12 @@ func WithRegion(region string) ModifierOpt {
+ 	return func(m *Modifier) { m.Region = region }
+ }
+ 
++
++// WithBaseArn sets the baseArn to use if we detect role name is not fully qualified
++func WithBaseArn(baseArn string) ModifierOpt {
++	return func(m *Modifier) { m.BaseArn = baseArn }
++}
++
+ // WithAnnotationDomain adds an annotation domain
+ func WithAnnotationDomain(domain string) ModifierOpt {
+ 	return func(m *Modifier) { m.AnnotationDomain = domain }
+@@ -88,11 +96,12 @@ func NewModifier(opts ...ModifierOpt) *Modifier {
+ // Modifier holds configuration values for pod modifications
+ type Modifier struct {
+ 	AnnotationDomain string
+-	MountPath        string
+-	Region           string
+-	Cache            cache.ServiceAccountCache
+-	volName          string
+-	tokenName        string
++	BaseArn             string
++	MountPath           string
++	Region              string
++	Cache               cache.ServiceAccountCache
++	volName             string
++	tokenName           string
+ }
+ 
+ type patchOperation struct {
+@@ -133,7 +142,7 @@ func getContainersToSkip(annotationDomain string, pod *corev1.Pod) map[string]bo
+ 	return skippedNames
+ }
+ 
+-func (m *Modifier) addEnvToContainer(container *corev1.Container, tokenFilePath, roleName string, regionalSTS bool) bool {
++func (m *Modifier) addEnvToContainer(container *corev1.Container, tokenFilePath, fullRoleArn string, regionalSTS bool) bool {
+ 	var (
+ 		reservedKeysDefined   bool
+ 		regionKeyDefined      bool
+@@ -197,7 +206,7 @@ func (m *Modifier) addEnvToContainer(container *corev1.Container, tokenFilePath,
+ 	if !reservedKeysDefined {
+ 		env = append(env, corev1.EnvVar{
+ 			Name:  "AWS_ROLE_ARN",
+-			Value: roleName,
++			Value: fullRoleArn,
+ 		})
+ 
+ 		env = append(env, corev1.EnvVar{
+@@ -230,6 +239,14 @@ func (m *Modifier) addEnvToContainer(container *corev1.Container, tokenFilePath,
+ 	return changed
+ }
+ 
++func (m *Modifier) fullRoleArn(arn string) string {
++	if strings.HasPrefix(arn, arnPrefix) {
++		return arn
++	}
++
++	return fmt.Sprintf("%s%s", m.BaseArn, arn)
++}
++
+ // parsePodAnnotations parses the pod annotations that can influence mutation:
+ // - tokenExpiration. Overrides the given service account annotation/flag-level
+ // setting.
+@@ -266,6 +283,8 @@ func (m *Modifier) getPodSpecPatch(pod *corev1.Pod, roleName, audience string, r
+ 		tokenFilePath = "C:" + strings.Replace(tokenFilePath, `/`, `\`, -1)
+ 	}
+ 
++	fullRoleArn := m.fullRoleArn(roleName)
++
+ 	var changed bool
+ 
+ 	var initContainers = []corev1.Container{}
+@@ -273,7 +292,7 @@ func (m *Modifier) getPodSpecPatch(pod *corev1.Pod, roleName, audience string, r
+ 		container := pod.Spec.InitContainers[i]
+ 		if _, ok := containersToSkip[container.Name]; ok {
+ 			klog.V(4).Infof("Container %s was annotated to be skipped", container.Name)
+-		} else if m.addEnvToContainer(&container, tokenFilePath, roleName, regionalSTS) {
++		} else if m.addEnvToContainer(&container, tokenFilePath, fullRoleArn, regionalSTS) {
+ 			changed = true
+ 		}
+ 		initContainers = append(initContainers, container)
+@@ -284,7 +303,7 @@ func (m *Modifier) getPodSpecPatch(pod *corev1.Pod, roleName, audience string, r
+ 		container := pod.Spec.Containers[i]
+ 		if _, ok := containersToSkip[container.Name]; ok {
+ 			klog.V(4).Infof("Container %s was annotated to be skipped", container.Name)
+-		} else if m.addEnvToContainer(&container, tokenFilePath, roleName, regionalSTS) {
++		} else if m.addEnvToContainer(&container, tokenFilePath, fullRoleArn, regionalSTS) {
+ 			changed = true
+ 		}
+ 		containers = append(containers, container)
+diff --git a/pkg/handler/handler_pod_test.go b/pkg/handler/handler_pod_test.go
+index 6a38aaa..b5beb90 100644
+--- a/pkg/handler/handler_pod_test.go
++++ b/pkg/handler/handler_pod_test.go
+@@ -50,6 +50,7 @@ var (
+ 	handlerExpirationAnnotation = "testing.eks.amazonaws.com/handler/expiration"
+ 	handlerRegionAnnotation     = "testing.eks.amazonaws.com/handler/region"
+ 	handlerSTSAnnotation        = "testing.eks.amazonaws.com/handler/injectSTS"
++	handlerBaseArnAnnotation    = "testing.eks.amazonaws.com/handler/baseArn"
+ )
+ 
+ // getTestValuesFromPod gets values to set up test case environments with as if
+@@ -92,6 +93,9 @@ func getTestValuesFromPod(pod corev1.Pod) (*Modifier, int64, bool, error) {
+ 		regionalSTS = value
+ 	}
+ 
++	if baseArnAnnotation, ok := pod.Annotations[handlerBaseArnAnnotation]; ok {
++		modifiers = append(modifiers, WithBaseArn(baseArnAnnotation))
++	}
+ 	return NewModifier(modifiers...), tokenExpiration, regionalSTS, nil
+ }
+ 
+diff --git a/pkg/handler/testdata/rawPodNoBaseArn.pod.yaml b/pkg/handler/testdata/rawPodNoBaseArn.pod.yaml
+new file mode 100644
+index 0000000..f1b764c
+--- /dev/null
++++ b/pkg/handler/testdata/rawPodNoBaseArn.pod.yaml
+@@ -0,0 +1,17 @@
++apiVersion: v1
++kind: Pod
++metadata:
++  name: balajilovesoreos
++  annotations:
++    testing.eks.amazonaws.com/handler/baseArn: 'arn:aws:iam::111122223333:role/'
++    testing.eks.amazonaws.com/skip: "false"
++    testing.eks.amazonaws.com/serviceAccount/roleArn: "s3-reader"
++    testing.eks.amazonaws.com/serviceAccount/audience: "sts.amazonaws.com"
++    testing.eks.amazonaws.com/expectedPatch: '[{"op":"add","path":"/spec/volumes/0","value":{"name":"aws-iam-token","projected":{"sources":[{"serviceAccountToken":{"audience":"sts.amazonaws.com","expirationSeconds":86400,"path":"token"}}]}}},{"op":"add","path":"/spec/containers","value":[{"name":"balajilovesoreos","image":"amazonlinux","env":[{"name":"AWS_ROLE_ARN","value":"arn:aws:iam::111122223333:role/s3-reader"},{"name":"AWS_WEB_IDENTITY_TOKEN_FILE","value":"/var/run/secrets/eks.amazonaws.com/serviceaccount/token"}],"resources":{},"volumeMounts":[{"name":"aws-iam-token","readOnly":true,"mountPath":"/var/run/secrets/eks.amazonaws.com/serviceaccount"}]}]}]'
++spec:
++  containers:
++  - image: amazonlinux
++    name: balajilovesoreos
++  serviceAccountName: default
++  volumes:
++    - name: my-volume
+-- 
+2.37.1 (Apple Git-137.1)
+
