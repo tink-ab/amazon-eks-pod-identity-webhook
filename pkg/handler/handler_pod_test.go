@@ -50,6 +50,7 @@ var (
 	handlerExpirationAnnotation = "testing.eks.amazonaws.com/handler/expiration"
 	handlerRegionAnnotation     = "testing.eks.amazonaws.com/handler/region"
 	handlerSTSAnnotation        = "testing.eks.amazonaws.com/handler/injectSTS"
+	handlerBaseArnAnnotation    = "testing.eks.amazonaws.com/handler/baseArn"
 )
 
 // getTestValuesFromPod gets values to set up test case environments with as if
@@ -92,6 +93,9 @@ func getTestValuesFromPod(pod corev1.Pod) (*Modifier, int64, bool, error) {
 		regionalSTS = value
 	}
 
+	if baseArnAnnotation, ok := pod.Annotations[handlerBaseArnAnnotation]; ok {
+		modifiers = append(modifiers, WithBaseArn(baseArnAnnotation))
+	}
 	return NewModifier(modifiers...), tokenExpiration, regionalSTS, nil
 }
 

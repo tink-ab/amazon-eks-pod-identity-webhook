@@ -47,6 +47,8 @@ var (
 	deserializer  = codecs.UniversalDeserializer()
 )
 
+const arnPrefix = "arn:"
+
 // ModifierOpt is an option type for setting up a Modifier
 type ModifierOpt func(*Modifier)
 
@@ -63,6 +65,12 @@ func WithMountPath(mountpath string) ModifierOpt {
 // WithRegion sets the modifier region
 func WithRegion(region string) ModifierOpt {
 	return func(m *Modifier) { m.Region = region }
+}
+
+
+// WithBaseArn sets the baseArn to use if we detect role name is not fully qualified
+func WithBaseArn(baseArn string) ModifierOpt {
+	return func(m *Modifier) { m.BaseArn = baseArn }
 }
 
 // WithAnnotationDomain adds an annotation domain
@@ -88,11 +96,12 @@ func NewModifier(opts ...ModifierOpt) *Modifier {
 // Modifier holds configuration values for pod modifications
 type Modifier struct {
 	AnnotationDomain string
-	MountPath        string
-	Region           string
-	Cache            cache.ServiceAccountCache
-	volName          string
-	tokenName        string
+	BaseArn             string
+	MountPath           string
+	Region              string
+	Cache               cache.ServiceAccountCache
+	volName             string
+	tokenName           string
 }
 
 type patchOperation struct {
@@ -133,7 +142,7 @@ func getContainersToSkip(annotationDomain string, pod *corev1.Pod) map[string]bo
 	return skippedNames
 }
 
-func (m *Modifier) addEnvToContainer(container *corev1.Container, tokenFilePath, roleName string, regionalSTS bool) bool {
+func (m *Modifier) addEnvToContainer(container *corev1.Container, tokenFilePath, fullRoleArn string, regionalSTS bool) bool {
 	var (
 		reservedKeysDefined   bool
 		regionKeyDefined      bool
@@ -197,7 +206,7 @@ func (m *Modifier) addEnvToContainer(container *corev1.Container, tokenFilePath,
 	if !reservedKeysDefined {
 		env = append(env, corev1.EnvVar{
 			Name:  "AWS_ROLE_ARN",
-			Value: roleName,
+			Value: fullRoleArn,
 		})
 
 		env = append(env, corev1.EnvVar{
@@ -228,6 +237,14 @@ func (m *Modifier) addEnvToContainer(container *corev1.Container, tokenFilePath,
 		changed = true
 	}
 	return changed
+}
+
+func (m *Modifier) fullRoleArn(arn string) string {
+	if strings.HasPrefix(arn, arnPrefix) {
+		return arn
+	}
+
+	return fmt.Sprintf("%s%s", m.BaseArn, arn)
 }
 
 // parsePodAnnotations parses the pod annotations that can influence mutation:
@@ -266,6 +283,8 @@ func (m *Modifier) getPodSpecPatch(pod *corev1.Pod, roleName, audience string, r
 		tokenFilePath = "C:" + strings.Replace(tokenFilePath, `/`, `\`, -1)
 	}
 
+	fullRoleArn := m.fullRoleArn(roleName)
+
 	var changed bool
 
 	var initContainers = []corev1.Container{}
@@ -273,7 +292,7 @@ func (m *Modifier) getPodSpecPatch(pod *corev1.Pod, roleName, audience string, r
 		container := pod.Spec.InitContainers[i]
 		if _, ok := containersToSkip[container.Name]; ok {
 			klog.V(4).Infof("Container %s was annotated to be skipped", container.Name)
-		} else if m.addEnvToContainer(&container, tokenFilePath, roleName, regionalSTS) {
+		} else if m.addEnvToContainer(&container, tokenFilePath, fullRoleArn, regionalSTS) {
 			changed = true
 		}
 		initContainers = append(initContainers, container)
@@ -284,7 +303,7 @@ func (m *Modifier) getPodSpecPatch(pod *corev1.Pod, roleName, audience string, r
 		container := pod.Spec.Containers[i]
 		if _, ok := containersToSkip[container.Name]; ok {
 			klog.V(4).Infof("Container %s was annotated to be skipped", container.Name)
-		} else if m.addEnvToContainer(&container, tokenFilePath, roleName, regionalSTS) {
+		} else if m.addEnvToContainer(&container, tokenFilePath, fullRoleArn, regionalSTS) {
 			changed = true
 		}
 		containers = append(containers, container)
