@@ -369,6 +369,10 @@ func (m *Modifier) MutatePod(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResp
 		return badRequest
 	}
 
+	if req.Resource.Resource != "pods" || (req.Operation != "CREATE" && req.Operation != "UPDATE") {
+		return badRequest
+	}
+
 	var pod corev1.Pod
 	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
 		klog.Errorf("Could not unmarshal raw object: %v", err)
