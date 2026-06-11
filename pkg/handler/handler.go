@@ -369,6 +369,10 @@ func (m *Modifier) MutatePod(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResp
 		return badRequest
 	}
 
+	if req.Resource.Resource != "pods" || (req.Operation != "CREATE" && req.Operation != "UPDATE") {
+		return badRequest
+	}
+
 	var pod corev1.Pod
 	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
 		klog.Errorf("Could not unmarshal raw object: %v", err)
@@ -442,7 +446,12 @@ func (m *Modifier) MutatePod(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResp
 func (m *Modifier) Handle(w http.ResponseWriter, r *http.Request) {
 	var body []byte
 	if r.Body != nil {
-		if data, err := ioutil.ReadAll(r.Body); err == nil {
+		r.Body = http.MaxBytesReader(w, r.Body, 3*1024*1024) // 3 MiB limit
+		if data, err := ioutil.ReadAll(r.Body); err != nil {
+			klog.Errorf("Error reading request body: %v", err)
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		} else {
 			body = data
 		}
 	}

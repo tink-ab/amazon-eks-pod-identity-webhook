@@ -267,6 +267,10 @@ func (c *serviceAccountCache) populateCacheFromCM(oldCM, newCM *v1.ConfigMap) er
 	}
 	for key, resp := range sas {
 		parts := strings.Split(key, "/")
+		if len(parts) != 2 {
+			klog.Warningf("Skipping ConfigMap entry with invalid key %q: expected format \"namespace/name\"", key)
+			continue
+		}
 		if resp.TokenExpiration == 0 {
 			resp.TokenExpiration = c.defaultTokenExpiration
 		}
@@ -283,6 +287,10 @@ func (c *serviceAccountCache) populateCacheFromCM(oldCM, newCM *v1.ConfigMap) er
 		for key := range oldCache {
 			if _, found := sas[key]; !found {
 				parts := strings.Split(key, "/")
+				if len(parts) != 2 {
+					klog.Warningf("Skipping old ConfigMap entry with invalid key %q: expected format \"namespace/name\"", key)
+					continue
+				}
 				c.popCM(parts[1], parts[0])
 			}
 		}
